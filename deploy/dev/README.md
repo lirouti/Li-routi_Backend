@@ -263,6 +263,17 @@ ssh ubuntu@<개발서버EIP> 'sudo mv /tmp/dc.yml /opt/app/docker-compose.yml \
 compose 가 `/opt/app/secrets/firebase-adminsdk.json` 을 마운트한다. **소스 파일이 없으면 Docker 가
 그 자리에 빈 디렉터리를 만들어 버리므로**, 켜지 않더라도 자리는 있어야 한다.
 
+> ⚠️ **키 파일 없이 FCM 을 끄려고 compose 의 연결 줄을 주석 처리하면, `app` 의 `volumes:` 줄도
+> 함께 주석 처리해야 한다.** 그 줄 아래 항목이 이것 하나뿐이라, 항목만 주석 처리하면 `volumes:` 가
+> 값 없는 키(`null`)로 남고 compose 검증이 실패한다. 새 서버 이전 때 첫 배포가 이것으로 멈췄다.
+>
+> ```
+> validating /opt/app/docker-compose.yml: services.app.volumes must be a array
+> ```
+>
+> 주석 처리한 뒤에는 배포 전에 `docker compose config -q && echo OK` 로 먼저 확인한다.
+> `.env` 가 아직 없어 변수 경고가 뜰 수 있으나, `OK` 가 나오면 된다.
+
 이 키는 `ENV_FILE` 에 넣지 않는다 — 평문 `key=value` 라 JSON 을 담기 부적합하다. **운영에 있는
 것을 그대로 옮기면 된다.** 내용을 화면에 띄우지 않고 넘기는 방법은 이렇다.
 
@@ -480,6 +491,66 @@ FROM flyway_schema_history WHERE version IS NULL GROUP BY script ORDER BY runs D
 - 지우는 행이 있다면, 그 행을 참조하는 데이터가 운영에 있는가
 
 > 개발 서버로 이것까지 잡으려면 **운영 백업을 복원한 DB 위에서** 배포해 봐야 한다. 그때 반드시 `fcm_device` 를 비워야 하는 이유는 아래 [운영 데이터를 개발로 가져올 때](#운영-데이터를-개발로-가져올-때) 를 볼 것.
+
+---
+
+# 개발 서버를 새 EC2 로 옮길 때
+
+기존 서버를 두고 새 EC2 로 갈아탈 때의 절차다. 위 1~8단계를 새 인스턴스에서 처음부터 다시 밟되,
+**도메인과 워크플로는 그대로 두고 아래 순서와 주의만 더한다.** 이번 이전(2026-11)에서 실제로 실행해
+확인한 것만 적는다.
+
+## 순서
+
+1. 새 인스턴스 준비 — 1단계(arm64 확인 포함), 3단계, 5단계, 6단계. compose 와 Caddyfile 은 `scp` 로 올린다
+2. **DNS 전환** — A 레코드의 IP 를 새 EIP 로 바꾸고, `dig +short lirouti-dev.kro.kr` 과 `dig +short @1.1.1.1 lirouti-dev.kro.kr` 이 둘 다 새 EIP 를 뱉는지 확인한다
+3. 리포지토리 시크릿 `DEV_SERVER_HOST`·`DEV_SERVER_SSH_KEY` 를 새 서버 값으로 갱신한다 (`DEV_ENV_FILE` 은 그대로 둘 수 있다)
+4. 워크플로를 수동으로 실행한다 — `gh workflow run deploy-dev.yml --ref develop`
+5. 확인한다 — 아래 [확인 명령](#이전-뒤-확인-명령)
+
+**EC2 사이의 이전은 워크플로를 고치지 않는다.** `deploy-dev.yml` 이 `DEV_SERVER_HOST` 시크릿만 보기 때문이다.
+**2단계와 4단계 사이에는 개발 서버가 닫힌다.** DNS 는 새 서버를 가리키는데 앱은 아직 없어서 연결이
+실패한다. 이 간격을 줄이고, 그 사이에 쓰는 사람에게 알린다. **전파를 확인하기 전에 배포하지 않는다** —
+먼저 배포하면 인증서 발급이 실패하고, 반복하면 발급 시도 한도를 쓴다.
+
+## 이번에 확인된 것
+
+- **인증서를 미리 옮기거나 선발급하지 않았다.** DNS 만 바꾸고 첫 배포에서 Caddy 가 새로 받았다.
+  발급자는 [위에서 설명한 대로](#인증서는-lets-encrypt-가-아니라-zerossl-이-발급했다) ZeroSSL 이었다.
+- **데이터는 옮기지 않았다.** 새 DB 볼륨에서 Flyway 가 마이그레이션 94개를 처음부터 적용했고, Redis 도
+  비어서 시작했다. **Redis 에 refresh 토큰이 있으므로 테스터는 한 번 다시 로그인해야 한다.**
+- **AMI 는 Ubuntu 26.04.1 이었다.** 위 1단계가 가리키는 24.04 가 아니었지만 `docker.io`·`docker-compose-v2`
+  설치와 첫 배포 모두 통과했다.
+- **`t3` 같은 x86 인스턴스는 쓸 수 없다.** 이미지를 `linux/arm64` 로만 빌드하므로 처음 만든 `t3.small` 은
+  실행이 안 돼 `t4g.small` 로 다시 만들었다. 인스턴스를 만든 직후 `uname -m` 이 `aarch64` 인지 먼저 본다.
+- **FCM 은 끈 채로 이전했다.** 키 파일을 올리지 않고 compose 의 연결 줄을 주석 처리했는데, `volumes:` 줄까지
+  처리하지 않아 첫 배포가 한 번 실패했다. [6단계의 주의](#fcm-서비스-계정-키)를 먼저 읽는다.
+
+## 이전 뒤 확인 명령
+
+워크플로의 https 확인은 실패해도 경고만 남기고 배포를 되돌리지 않는다. **초록색 결과만 믿지 말고 직접 본다.**
+
+```bash
+curl -I https://lirouti-dev.kro.kr/health                              # 200
+echo | openssl s_client -connect lirouti-dev.kro.kr:443 -servername lirouti-dev.kro.kr 2>/dev/null \
+  | openssl x509 -noout -issuer -dates                                 # 새로 발급된 인증서인지
+
+# 서버에서 (/opt/app)
+docker compose ps                                                      # db·redis 는 healthy, app·caddy 는 Up
+docker compose exec -T db sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" -e "SELECT COUNT(*) FROM lirouti.flyway_schema_history"'
+```
+
+마지막 명령은 `.env` 의 DB 비밀번호가 볼륨에 굳은 값과 일치하는지도 함께 보여 준다.
+`.env` 값은 대화나 화면에 붙이지 않는다. 키 이름과 비어 있는지만 보려면 이렇게 한다.
+
+```bash
+awk -F= '/^[A-Za-z_]/ {print $1, ($2=="" ? "EMPTY" : "set")}' /opt/app/.env
+```
+
+## 옛 서버 정리
+
+새 서버를 며칠 운영해 이상이 없는 것을 확인한 **뒤에** 옛 인스턴스를 종료한다. 종료하면 그 서버의 데이터는
+복구할 수 없다. **EIP 는 인스턴스를 종료해도 남아 계속 과금되므로 따로 반납한다.**
 
 ---
 
